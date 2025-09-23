@@ -1,5 +1,5 @@
-# Dockerfile Simple - Architecture ILN Multi-Language
-# Fichiers séparés : main.go + app.js + app.py + package.json
+# ILN Architecture 1 Modifiée - JavaScript Orchestrator
+# Dockerfile gère toutes les dépendances - Pas de package.json
 
 # ===============================================
 # ÉTAPE 1: COMPILATION GO
@@ -9,51 +9,45 @@ WORKDIR /go-app
 COPY main.go .
 RUN go mod init go-service && go build -o go-service main.go
 
-# ===============================================  
-# ÉTAPE 2: SETUP NODE.JS (Docker gère les dépendances)
 # ===============================================
-FROM node:18-alpine AS node-builder
-WORKDIR /node-app
-
-# Docker gère les dépendances au lieu de package.json
-RUN npm install express --production
-
-# Copier seulement le code applicatif
-COPY app.js ./
-
+# ÉTAPE 2: CONTAINER FINAL JAVASCRIPT + PYTHON
 # ===============================================
-# ÉTAPE 3: CONTAINER FINAL PYTHON
-# ===============================================
-FROM python:3.11-slim AS final
+FROM node:18-slim AS final
 
-# Installer Node.js dans le container final
+# Installer Python et dépendances système
 RUN apt-get update && apt-get install -y \
-    nodejs npm \
+    python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Installer les dépendances Python
-RUN pip install --no-cache-dir \
+# Docker gère les dépendances Node.js (pas de package.json)
+RUN npm install -g \
+    express \
+    node-fetch
+
+# Docker gère les dépendances Python (pas de requirements.txt)  
+RUN pip3 install --no-cache-dir \
     flask \
-    requests
+    psutil
 
 # Créer la structure des services
-RUN mkdir -p /app/services/node-service
+RUN mkdir -p /app/services
 
-# Copier tous les services compilés/préparés
+# Copier le binaire Go compilé
 COPY --from=go-builder /go-app/go-service /app/services/
-COPY --from=node-builder /node-app/ /app/services/node-service/
 
-# Copier l'orchestrateur principal Python
-COPY app.py /app/app.py
+# Copier les services
+COPY app.js /app/app.js
+COPY python-service.py /app/services/
 
 # Variables d'environnement
 ENV PORT=8000
+ENV NODE_ENV=production
 ENV PYTHONUNBUFFERED=1
-ENV GO_PORT=8001
-ENV NODE_PORT=8002
 
-# Point de démarrage
-WORKDIR /app
+# Exposer tous les ports
 EXPOSE 8000 8001 8002
 
-CMD ["python", "app.py"]
+WORKDIR /app
+
+# Point d'entrée : JavaScript Orchestrator
+CMD ["node", "app.js"]

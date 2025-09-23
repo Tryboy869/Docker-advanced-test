@@ -24,8 +24,8 @@ RUN npm install -g \
     express \
     node-fetch
 
-# Docker gère les dépendances Python (pas de requirements.txt)  
-RUN pip3 install --no-cache-dir \
+# Docker gère les dépendances Python (contournement environnement géré)
+RUN pip3 install --break-system-packages --no-cache-dir \
     flask \
     psutil
 

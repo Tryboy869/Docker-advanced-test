@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-deps flask requests
 
 # Copier service Python
-COPY service.py .
+COPY python-service.py .
 
 # === STAGE FINAL: NODE.JS ORCHESTRATEUR ===
 FROM node:18-slim AS final

@@ -1,41 +1,88 @@
-# Alternative plus propre : partir d'une image Python
-FROM python:3.11-slim AS final
+# syntax=docker/dockerfile:1
+# check=error=true
 
-# Installer Node.js dans l'image Python
-RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && \
-    apt-get install -y nodejs && \
-    rm -rf /var/lib/apt/lists/*
+# ARCHITECTURE 1B CORRIGÉE - JavaScript Orchestrateur Multi-Language
+# Basée sur les validations expérimentales et syntaxe Docker 2025
 
-# Docker gère les dépendances Node.js
-RUN npm install -g \
-    express \
-    node-fetch
-
-# Docker gère les dépendances Python (plus de problème d'environnement géré)
-RUN pip install --no-cache-dir \
-    flask \
-    psutil
-
-# Compiler Go dans une étape séparée
+# === STAGE 1: BUILD GO SERVICE ===
 FROM golang:1.22-alpine AS go-builder
-WORKDIR /go-app
+WORKDIR /go-service
+
+# Optimisation cache - Copier go.mod en premier si existe
 COPY main.go .
-RUN go mod init go-service && go build -o go-service main.go
 
-# Continuer avec l'image Python
-FROM final
+# Initialiser module et builder avec optimisations
+RUN <<EOF
+go mod init go-service
+go build -ldflags="-s -w" -o go-service main.go
+chmod +x go-service
+EOF
 
-# Créer structure et copier fichiers
+# === STAGE 2: PRÉPARER SERVICE PYTHON ===
+FROM python:3.11-slim AS python-builder
+WORKDIR /python-service
+
+# Installation dépendances Python avec cache mount
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps flask requests
+
+# Copier service Python
+COPY service.py .
+
+# === STAGE FINAL: NODE.JS ORCHESTRATEUR ===
+FROM node:18-slim AS final
+
+# Installation runtimes dans l'ordre correct
+RUN <<EOF
+apt-get update
+apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+EOF
+
+# Installation dépendances Node.js avec cache mount
+RUN --mount=type=cache,target=/root/.npm \
+    npm install express
+
+# Installation dépendances Python dans le container final
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install --no-cache-dir flask requests
+
+# Structure services
 RUN mkdir -p /app/services
-COPY --from=go-builder /go-app/go-service /app/services/
-COPY app.js /app/app.js
-COPY python-service.py /app/services/
 
+# Copier executables avec bonnes permissions
+COPY --from=go-builder --chmod=755 /go-service/go-service /app/services/
+COPY --from=python-builder /python-service/ /app/services/python-service/
+
+# Copier orchestrateur JavaScript
+COPY app.js /app/
+
+# Variables d'environnement
 ENV PORT=8000
-ENV NODE_ENV=production
 ENV PYTHONUNBUFFERED=1
+ENV NODE_ENV=production
 
-EXPOSE 8000 8001 8002
+# Configuration utilisateur sécurisé
+RUN <<EOF
+groupadd -r appgroup
+useradd -r -g appgroup -s /bin/false appuser
+chown -R appuser:appgroup /app
+EOF
 
+# Configuration finale
 WORKDIR /app
+EXPOSE 8000
+
+# Health check obligatoire
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Utilisateur non-root obligatoire
+USER appuser
+
+# Point d'entrée JavaScript orchestrateur
 CMD ["node", "app.js"]

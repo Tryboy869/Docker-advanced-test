@@ -1,11 +1,11 @@
 // ==========================================
-// ILN Architecture 1B - JavaScript Orchestrateur
-// Gestion services Go, Python et interface unifiée
+// ILN Architecture 1B - SANS EXPRESS
+// Serveur HTTP natif Node.js pour éviter problèmes npm
 // ==========================================
 
-const express = require('express');
-const { spawn } = require('child_process');
 const http = require('http');
+const { spawn } = require('child_process');
+const { URL } = require('url');
 
 class ServiceManager {
     constructor() {
@@ -16,17 +16,16 @@ class ServiceManager {
             pythonService: 8002
         };
         
-        // Configuration services
         this.serviceConfigs = {
             go: {
-                command: './services/go-service',
-                args: ['-port', this.ports.goService],
+                command: './go-service',
+                args: [],
                 port: this.ports.goService,
                 healthPath: '/health'
             },
             python: {
                 command: 'python3',
-                args: ['./services/python-service/python-service.py'],
+                args: ['python-service.py'],
                 port: this.ports.pythonService,
                 healthPath: '/health',
                 env: { 
@@ -52,7 +51,6 @@ class ServiceManager {
             message
         });
         
-        // Garder seulement les 100 derniers logs
         if (this.startupLog.length > 100) {
             this.startupLog.shift();
         }
@@ -68,11 +66,9 @@ class ServiceManager {
         
         const process = spawn(config.command, config.args || [], {
             env: config.env || process.env,
-            cwd: '/app',
             stdio: ['ignore', 'pipe', 'pipe']
         });
 
-        // Gestion des logs du service
         process.stdout.on('data', (data) => {
             this.log(`${serviceName} STDOUT: ${data.toString().trim()}`, 'DEBUG');
         });
@@ -102,7 +98,6 @@ class ServiceManager {
             status: 'starting'
         });
 
-        // Attendre que le service soit disponible
         await this.waitForServiceHealth(serviceName);
         
         const serviceInfo = this.services.get(serviceName);
@@ -113,8 +108,6 @@ class ServiceManager {
     }
 
     async waitForServiceHealth(serviceName, maxAttempts = 30, delay = 1000) {
-        const config = this.serviceConfigs[serviceName];
-        
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 await this.checkServiceHealth(serviceName);
@@ -249,7 +242,6 @@ class ServiceManager {
                 this.log(`Arrêt service ${serviceName}`, 'INFO');
                 serviceInfo.process.kill('SIGTERM');
                 
-                // Attendre un peu, puis forcer l'arrêt si nécessaire
                 setTimeout(() => {
                     if (!serviceInfo.process.killed) {
                         serviceInfo.process.kill('SIGKILL');
@@ -265,13 +257,10 @@ class ServiceManager {
 }
 
 // ==========================================
-// INITIALISATION ORCHESTRATEUR
+// SERVEUR HTTP NATIF (Sans Express)
 // ==========================================
 
-const app = express();
 const serviceManager = new ServiceManager();
-
-app.use(express.json());
 
 // Gestion gracieuse des arrêts
 process.on('SIGTERM', async () => {
@@ -286,133 +275,176 @@ process.on('SIGINT', async () => {
     process.exit(0);
 });
 
-// ==========================================
-// ROUTES API
-// ==========================================
+// Fonction pour parser le body des requêtes POST
+function parseBody(req) {
+    return new Promise((resolve) => {
+        let body = '';
+        req.on('data', (chunk) => {
+            body += chunk;
+        });
+        req.on('end', () => {
+            try {
+                const jsonBody = body ? JSON.parse(body) : {};
+                resolve(jsonBody);
+            } catch (error) {
+                resolve({});
+            }
+        });
+    });
+}
 
-// Health check orchestrateur
-app.get('/health', (req, res) => {
-    const serviceStatuses = serviceManager.getServiceStatus();
-    const allHealthy = Object.values(serviceStatuses).every(s => s.status === 'running');
+// Fonction pour envoyer réponse JSON
+function sendJSON(res, data, statusCode = 200) {
+    res.writeHead(statusCode, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type'
+    });
+    res.end(JSON.stringify(data, null, 2));
+}
+
+// Serveur HTTP natif
+const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://localhost:${serviceManager.ports.orchestrator}`);
+    const path = url.pathname;
+    const method = req.method;
     
-    res.status(allHealthy ? 200 : 503).json({
-        status: allHealthy ? 'healthy' : 'unhealthy',
-        orchestrator: 'running',
-        services: serviceStatuses,
-        timestamp: new Date().toISOString()
-    });
-});
-
-// Status détaillé
-app.get('/status', (req, res) => {
-    res.json({
-        orchestrator: {
-            status: 'running',
-            language: 'JavaScript',
-            version: '1.0.0',
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            pid: process.pid
-        },
-        services: serviceManager.getServiceStatus(),
-        logs: serviceManager.startupLog.slice(-20) // 20 derniers logs
-    });
-});
-
-// Traitement Go service
-app.post('/process/go', async (req, res) => {
     try {
-        const response = await serviceManager.makeServiceRequest('go', '/process', 'POST', req.body);
+        // CORS preflight
+        if (method === 'OPTIONS') {
+            res.writeHead(200, {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type'
+            });
+            res.end();
+            return;
+        }
         
-        res.json({
-            orchestrator: {
-                message: 'Successfully processed with Go service',
-                language: 'JavaScript'
-            },
-            go_service: response.data
-        });
+        // Route: Health check orchestrateur
+        if (path === '/health' && method === 'GET') {
+            const serviceStatuses = serviceManager.getServiceStatus();
+            const allHealthy = Object.values(serviceStatuses).every(s => s.status === 'running');
+            
+            sendJSON(res, {
+                status: allHealthy ? 'healthy' : 'unhealthy',
+                orchestrator: 'running',
+                services: serviceStatuses,
+                timestamp: new Date().toISOString()
+            }, allHealthy ? 200 : 503);
+            return;
+        }
+        
+        // Route: Status détaillé
+        if (path === '/status' && method === 'GET') {
+            sendJSON(res, {
+                orchestrator: {
+                    status: 'running',
+                    language: 'JavaScript',
+                    version: '1.0.0',
+                    uptime: process.uptime(),
+                    memory: process.memoryUsage(),
+                    pid: process.pid
+                },
+                services: serviceManager.getServiceStatus(),
+                logs: serviceManager.startupLog.slice(-20)
+            });
+            return;
+        }
+        
+        // Route: Traitement Go service
+        if (path === '/process/go' && method === 'POST') {
+            const body = await parseBody(req);
+            const response = await serviceManager.makeServiceRequest('go', '/process', 'POST', body);
+            
+            sendJSON(res, {
+                orchestrator: {
+                    message: 'Successfully processed with Go service',
+                    language: 'JavaScript'
+                },
+                go_service: response.data
+            });
+            return;
+        }
+        
+        // Route: Traitement Python service
+        if (path === '/process/python' && method === 'POST') {
+            const body = await parseBody(req);
+            const response = await serviceManager.makeServiceRequest('python', '/process', 'POST', body);
+            
+            sendJSON(res, {
+                orchestrator: {
+                    message: 'Successfully processed with Python service',
+                    language: 'JavaScript'
+                },
+                python_service: response.data
+            });
+            return;
+        }
+        
+        // Route: Traitement coordonné multi-services
+        if (path === '/process/multi' && method === 'POST') {
+            const body = await parseBody(req);
+            const startTime = Date.now();
+            
+            const [goResponse, pythonResponse] = await Promise.all([
+                serviceManager.makeServiceRequest('go', '/process', 'POST', body),
+                serviceManager.makeServiceRequest('python', '/process', 'POST', body)
+            ]);
+            
+            const processingTime = Date.now() - startTime;
+            
+            sendJSON(res, {
+                orchestrator: {
+                    message: 'Successfully orchestrated multi-language processing',
+                    language: 'JavaScript',
+                    processing_time_ms: processingTime,
+                    services_coordinated: ['go', 'python']
+                },
+                go_service: goResponse.data,
+                python_service: pythonResponse.data
+            });
+            return;
+        }
+        
+        // Route: Page d'accueil
+        if (path === '/' && method === 'GET') {
+            sendJSON(res, {
+                message: 'ILN Architecture 1B - JavaScript Orchestrateur (Sans Express)',
+                capabilities: [
+                    'Multi-language service orchestration',
+                    'Go service integration',
+                    'Python service integration', 
+                    'Parallel processing coordination',
+                    'Health monitoring',
+                    'Service lifecycle management'
+                ],
+                endpoints: [
+                    'GET /health - Health check',
+                    'GET /status - Detailed status',
+                    'POST /process/go - Process with Go service',
+                    'POST /process/python - Process with Python service',
+                    'POST /process/multi - Coordinated multi-service processing'
+                ]
+            });
+            return;
+        }
+        
+        // Route non trouvée
+        sendJSON(res, {
+            error: 'Route not found',
+            path: path,
+            method: method
+        }, 404);
+        
     } catch (error) {
-        serviceManager.log(`Erreur traitement Go: ${error.message}`, 'ERROR');
-        res.status(500).json({
-            error: 'Go service processing failed',
+        serviceManager.log(`Erreur serveur: ${error.message}`, 'ERROR');
+        sendJSON(res, {
+            error: 'Internal server error',
             message: error.message
-        });
+        }, 500);
     }
-});
-
-// Traitement Python service  
-app.post('/process/python', async (req, res) => {
-    try {
-        const response = await serviceManager.makeServiceRequest('python', '/process', 'POST', req.body);
-        
-        res.json({
-            orchestrator: {
-                message: 'Successfully processed with Python service',
-                language: 'JavaScript'
-            },
-            python_service: response.data
-        });
-    } catch (error) {
-        serviceManager.log(`Erreur traitement Python: ${error.message}`, 'ERROR');
-        res.status(500).json({
-            error: 'Python service processing failed',
-            message: error.message
-        });
-    }
-});
-
-// Traitement coordonné multi-services
-app.post('/process/multi', async (req, res) => {
-    try {
-        const startTime = Date.now();
-        
-        // Traitement parallèle des services
-        const [goResponse, pythonResponse] = await Promise.all([
-            serviceManager.makeServiceRequest('go', '/process', 'POST', req.body),
-            serviceManager.makeServiceRequest('python', '/process', 'POST', req.body)
-        ]);
-        
-        const processingTime = Date.now() - startTime;
-        
-        res.json({
-            orchestrator: {
-                message: 'Successfully orchestrated multi-language processing',
-                language: 'JavaScript',
-                processing_time_ms: processingTime,
-                services_coordinated: ['go', 'python']
-            },
-            go_service: goResponse.data,
-            python_service: pythonResponse.data
-        });
-    } catch (error) {
-        serviceManager.log(`Erreur traitement multi-services: ${error.message}`, 'ERROR');
-        res.status(500).json({
-            error: 'Multi-service processing failed',
-            message: error.message
-        });
-    }
-});
-
-// Route de démonstration des capacités
-app.get('/', (req, res) => {
-    res.json({
-        message: 'ILN Architecture 1B - JavaScript Orchestrateur',
-        capabilities: [
-            'Multi-language service orchestration',
-            'Go service integration',
-            'Python service integration', 
-            'Parallel processing coordination',
-            'Health monitoring',
-            'Service lifecycle management'
-        ],
-        endpoints: [
-            'GET /health - Health check',
-            'GET /status - Detailed status',
-            'POST /process/go - Process with Go service',
-            'POST /process/python - Process with Python service',
-            'POST /process/multi - Coordinated multi-service processing'
-        ]
-    });
 });
 
 // ==========================================
@@ -421,7 +453,7 @@ app.get('/', (req, res) => {
 
 async function startOrchestrator() {
     try {
-        serviceManager.log('Démarrage ILN Architecture 1B - JavaScript Orchestrateur', 'INFO');
+        serviceManager.log('Démarrage ILN Architecture 1B - JavaScript Orchestrateur (Sans Express)', 'INFO');
         
         // Démarrer les services en parallèle
         await Promise.all([
@@ -430,17 +462,16 @@ async function startOrchestrator() {
         ]);
         
         // Démarrer le serveur orchestrateur
-        const server = app.listen(serviceManager.ports.orchestrator, () => {
+        server.listen(serviceManager.ports.orchestrator, () => {
             serviceManager.log(`Orchestrateur JavaScript démarré sur le port ${serviceManager.ports.orchestrator}`, 'INFO');
             serviceManager.log('Tous les services sont opérationnels', 'INFO');
             
-            // Affichage de confirmation
-            console.log('\n🚀 ILN ARCHITECTURE 1B OPÉRATIONNELLE');
-            console.log('=====================================');
+            console.log('\n🚀 ILN ARCHITECTURE 1B OPÉRATIONNELLE (SANS EXPRESS)');
+            console.log('=====================================================');
             console.log(`🎯 Orchestrateur JavaScript: http://localhost:${serviceManager.ports.orchestrator}`);
             console.log(`⚡ Service Go: port ${serviceManager.ports.goService}`);
             console.log(`🐍 Service Python: port ${serviceManager.ports.pythonService}`);
-            console.log('=====================================\n');
+            console.log('=====================================================\n');
         });
         
         // Gestion gracieuse des arrêts du serveur

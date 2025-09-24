@@ -1,407 +1,461 @@
-#!/usr/bin/env node
-
-/**
- * ILN Architecture 1 Modifiée - JavaScript comme Orchestrateur Principal
- * Gère l'interface utilisateur ET l'orchestration des services
- */
+// ==========================================
+// ILN Architecture 1B - JavaScript Orchestrateur
+// Gestion services Go, Python et interface unifiée
+// ==========================================
 
 const express = require('express');
 const { spawn } = require('child_process');
-const fetch = require('node-fetch');
-const path = require('path');
+const http = require('http');
 
-class ILNJavaScriptOrchestrator {
+class ServiceManager {
     constructor() {
         this.services = new Map();
-        this.app = express();
-        this.port = process.env.PORT || 8000;
-        this.setupMiddleware();
-        this.setupRoutes();
-    }
-
-    setupMiddleware() {
-        this.app.use(express.json());
-        this.app.use(express.static(path.join(__dirname, 'public')));
-    }
-
-    log(message) {
-        const timestamp = new Date().toISOString();
-        console.log(`[${timestamp}] [JS-ORCHESTRATOR] ${message}`);
-    }
-
-    async startService(serviceName, config) {
-        this.log(`Démarrage du service ${serviceName}...`);
+        this.ports = {
+            orchestrator: process.env.PORT || 8000,
+            goService: 8001,
+            pythonService: 8002
+        };
         
-        try {
-            const process = spawn(config.command[0], config.command.slice(1), {
-                stdio: ['pipe', 'pipe', 'pipe'],
-                env: { ...process.env, ...config.env }
-            });
+        // Configuration services
+        this.serviceConfigs = {
+            go: {
+                command: './services/go-service',
+                args: ['-port', this.ports.goService],
+                port: this.ports.goService,
+                healthPath: '/health'
+            },
+            python: {
+                command: 'python3',
+                args: ['./services/python-service/python-service.py'],
+                port: this.ports.pythonService,
+                healthPath: '/health',
+                env: { 
+                    ...process.env, 
+                    FLASK_PORT: this.ports.pythonService,
+                    PYTHONUNBUFFERED: '1'
+                }
+            }
+        };
+        
+        this.startupLog = [];
+        this.isShuttingDown = false;
+    }
 
-            process.stdout.on('data', (data) => {
-                this.log(`[${serviceName}] ${data.toString().trim()}`);
-            });
+    log(message, level = 'INFO') {
+        const timestamp = new Date().toISOString();
+        const logEntry = `[${timestamp}] [${level}] ${message}`;
+        console.log(logEntry);
+        
+        this.startupLog.push({
+            timestamp,
+            level,
+            message
+        });
+        
+        // Garder seulement les 100 derniers logs
+        if (this.startupLog.length > 100) {
+            this.startupLog.shift();
+        }
+    }
 
-            process.stderr.on('data', (data) => {
-                this.log(`[${serviceName} ERROR] ${data.toString().trim()}`);
-            });
+    async startService(serviceName) {
+        const config = this.serviceConfigs[serviceName];
+        if (!config) {
+            throw new Error(`Service ${serviceName} non configuré`);
+        }
 
-            process.on('exit', (code) => {
-                this.log(`[${serviceName}] Processus terminé avec le code ${code}`);
-                this.services.delete(serviceName);
-            });
+        this.log(`Démarrage service ${serviceName}...`, 'INFO');
+        
+        const process = spawn(config.command, config.args || [], {
+            env: config.env || process.env,
+            cwd: '/app',
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
 
-            this.services.set(serviceName, {
-                process: process,
-                config: config,
-                startTime: Date.now(),
-                status: 'running'
-            });
+        // Gestion des logs du service
+        process.stdout.on('data', (data) => {
+            this.log(`${serviceName} STDOUT: ${data.toString().trim()}`, 'DEBUG');
+        });
 
-            this.log(`Service ${serviceName} démarré avec PID ${process.pid}`);
-            return true;
-        } catch (error) {
-            this.log(`Erreur lors du démarrage de ${serviceName}: ${error.message}`);
-            return false;
+        process.stderr.on('data', (data) => {
+            const message = data.toString().trim();
+            if (!message.includes('WARNING') && !message.includes('INFO')) {
+                this.log(`${serviceName} STDERR: ${message}`, 'WARN');
+            }
+        });
+
+        process.on('close', (code) => {
+            this.log(`Service ${serviceName} fermé avec code ${code}`, 
+                     code === 0 ? 'INFO' : 'ERROR');
+            this.services.delete(serviceName);
+        });
+
+        process.on('error', (error) => {
+            this.log(`Erreur service ${serviceName}: ${error.message}`, 'ERROR');
+            this.services.delete(serviceName);
+        });
+
+        this.services.set(serviceName, {
+            process,
+            config,
+            startTime: Date.now(),
+            status: 'starting'
+        });
+
+        // Attendre que le service soit disponible
+        await this.waitForServiceHealth(serviceName);
+        
+        const serviceInfo = this.services.get(serviceName);
+        if (serviceInfo) {
+            serviceInfo.status = 'running';
+            this.log(`Service ${serviceName} démarré avec succès sur le port ${config.port}`, 'INFO');
+        }
+    }
+
+    async waitForServiceHealth(serviceName, maxAttempts = 30, delay = 1000) {
+        const config = this.serviceConfigs[serviceName];
+        
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                await this.checkServiceHealth(serviceName);
+                this.log(`Health check ${serviceName} réussi (tentative ${attempt})`, 'DEBUG');
+                return true;
+            } catch (error) {
+                if (attempt === maxAttempts) {
+                    this.log(`Health check ${serviceName} échoué après ${maxAttempts} tentatives`, 'ERROR');
+                    throw new Error(`Service ${serviceName} non disponible après ${maxAttempts} tentatives`);
+                }
+                
+                if (attempt % 5 === 0) {
+                    this.log(`Attente health check ${serviceName} - tentative ${attempt}/${maxAttempts}`, 'DEBUG');
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
         }
     }
 
     async checkServiceHealth(serviceName) {
-        const service = this.services.get(serviceName);
-        if (!service) {
-            return { healthy: false, reason: 'Service non trouvé' };
-        }
-
-        try {
-            const response = await fetch(`http://localhost:${service.config.port}/health`, {
+        const config = this.serviceConfigs[serviceName];
+        
+        return new Promise((resolve, reject) => {
+            const req = http.request({
+                hostname: 'localhost',
+                port: config.port,
+                path: config.healthPath || '/health',
                 method: 'GET',
-                timeout: 3000
+                timeout: 5000
+            }, (res) => {
+                if (res.statusCode === 200) {
+                    resolve(true);
+                } else {
+                    reject(new Error(`Health check failed: ${res.statusCode}`));
+                }
             });
-
-            if (response.ok) {
-                const data = await response.json();
-                return { healthy: true, data };
-            } else {
-                return { healthy: false, reason: `HTTP ${response.status}` };
-            }
-        } catch (error) {
-            return { healthy: false, reason: error.message };
-        }
-    }
-
-    async callService(serviceName, endpoint, data = null) {
-        const service = this.services.get(serviceName);
-        if (!service) {
-            return { error: 'Service non disponible' };
-        }
-
-        try {
-            const url = `http://localhost:${service.config.port}${endpoint}`;
-            const options = {
-                method: data ? 'POST' : 'GET',
-                timeout: 5000,
-                headers: { 'Content-Type': 'application/json' }
-            };
-
-            if (data) {
-                options.body = JSON.stringify(data);
-            }
-
-            const response = await fetch(url, options);
-            const result = await response.json();
             
-            return { success: true, data: result };
-        } catch (error) {
-            return { error: error.message };
-        }
+            req.on('error', reject);
+            req.on('timeout', () => reject(new Error('Health check timeout')));
+            req.end();
+        });
     }
 
-    getSystemStatus() {
-        const status = {
-            orchestrator: 'JavaScript',
-            timestamp: new Date().toISOString(),
-            services: {},
-            totalServices: this.services.size
-        };
-
-        for (const [name, service] of this.services.entries()) {
-            status.services[name] = {
-                status: service.status,
-                port: service.config.port,
-                uptime: Date.now() - service.startTime,
-                pid: service.process ? service.process.pid : null
-            };
+    async makeServiceRequest(serviceName, path = '/', method = 'GET', body = null) {
+        const config = this.serviceConfigs[serviceName];
+        const serviceInfo = this.services.get(serviceName);
+        
+        if (!serviceInfo || serviceInfo.status !== 'running') {
+            throw new Error(`Service ${serviceName} non disponible`);
         }
 
+        return new Promise((resolve, reject) => {
+            const reqOptions = {
+                hostname: 'localhost',
+                port: config.port,
+                path: path,
+                method: method,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'ILN-Orchestrator/1.0'
+                },
+                timeout: 10000
+            };
+
+            const req = http.request(reqOptions, (res) => {
+                let data = '';
+                
+                res.on('data', (chunk) => {
+                    data += chunk;
+                });
+                
+                res.on('end', () => {
+                    try {
+                        const jsonData = data ? JSON.parse(data) : {};
+                        resolve({
+                            statusCode: res.statusCode,
+                            data: jsonData
+                        });
+                    } catch (error) {
+                        resolve({
+                            statusCode: res.statusCode,
+                            data: { response: data, raw: true }
+                        });
+                    }
+                });
+            });
+            
+            req.on('error', (error) => {
+                this.log(`Erreur requête ${serviceName}: ${error.message}`, 'ERROR');
+                reject(error);
+            });
+            
+            req.on('timeout', () => {
+                this.log(`Timeout requête ${serviceName}`, 'WARN');
+                req.destroy();
+                reject(new Error('Request timeout'));
+            });
+            
+            if (body) {
+                req.write(typeof body === 'string' ? body : JSON.stringify(body));
+            }
+            
+            req.end();
+        });
+    }
+
+    getServiceStatus() {
+        const status = {};
+        
+        for (const [name, serviceInfo] of this.services.entries()) {
+            status[name] = {
+                status: serviceInfo.status,
+                pid: serviceInfo.process.pid,
+                startTime: serviceInfo.startTime,
+                uptime: Date.now() - serviceInfo.startTime,
+                port: serviceInfo.config.port
+            };
+        }
+        
         return status;
     }
 
-    setupRoutes() {
-        // Route principale avec interface utilisateur
-        this.app.get('/', (req, res) => {
-            res.send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>ILN Architecture 1 - JavaScript Orchestrator</title>
-                <style>
-                    body { font-family: Arial, sans-serif; margin: 40px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; min-height: 100vh; }
-                    .container { max-width: 900px; margin: 0 auto; background: rgba(255,255,255,0.1); padding: 30px; border-radius: 15px; backdrop-filter: blur(10px); }
-                    .service-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 20px 0; }
-                    .service-card { background: rgba(255,255,255,0.2); padding: 20px; border-radius: 10px; }
-                    button { background: linear-gradient(45deg, #FF6B6B, #4ECDC4); color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
-                    .results { background: rgba(0,0,0,0.3); padding: 20px; border-radius: 10px; margin: 20px 0; white-space: pre-wrap; font-family: monospace; }
-                    .orchestrator-info { background: rgba(76, 175, 80, 0.3); padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #4CAF50; }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>ILN Architecture 1 Modifiée</h1>
-                    <div class="orchestrator-info">
-                        <h3>🎯 JavaScript Orchestrator</h3>
-                        <p>Interface utilisateur + Orchestration des services dans un seul runtime</p>
-                        <p><strong>Innovation:</strong> JavaScript gère à la fois l'UI et la coordination des services</p>
-                    </div>
-                    
-                    <div class="service-grid">
-                        <div class="service-card">
-                            <h3>🌐 JavaScript</h3>
-                            <p>Interface + Orchestrateur</p>
-                            <button onclick="testJavaScript()">Test JavaScript</button>
-                        </div>
-                        <div class="service-card">
-                            <h3>🐹 Go Service</h3>
-                            <p>Moteur de concurrence</p>
-                            <button onclick="testGo()">Test Go</button>
-                        </div>
-                        <div class="service-card">
-                            <h3>🐍 Python Service</h3>
-                            <p>Moteur de traitement</p>
-                            <button onclick="testPython()">Test Python</button>
-                        </div>
-                    </div>
-                    
-                    <button onclick="testFullOrchestration()">🎯 Test Orchestration Complète</button>
-                    <button onclick="getStatus()">📊 Statut Système</button>
-                    <button onclick="healthCheckAll()">🏥 Health Check Tous Services</button>
-                    
-                    <div class="results" id="results">
-                        JavaScript Orchestrator prêt. Cliquez pour tester les services...
-                    </div>
-                </div>
-
-                <script>
-                    async function testJavaScript() {
-                        document.getElementById('results').innerHTML = 'Testing JavaScript orchestrator...';
-                        try {
-                            const response = await fetch('/api/js-test');
-                            const result = await response.json();
-                            document.getElementById('results').innerHTML = JSON.stringify(result, null, 2);
-                        } catch (error) {
-                            document.getElementById('results').innerHTML = \`Error: \${error.message}\`;
-                        }
+    async shutdown() {
+        if (this.isShuttingDown) return;
+        this.isShuttingDown = true;
+        
+        this.log('Arrêt des services...', 'INFO');
+        
+        for (const [serviceName, serviceInfo] of this.services.entries()) {
+            try {
+                this.log(`Arrêt service ${serviceName}`, 'INFO');
+                serviceInfo.process.kill('SIGTERM');
+                
+                // Attendre un peu, puis forcer l'arrêt si nécessaire
+                setTimeout(() => {
+                    if (!serviceInfo.process.killed) {
+                        serviceInfo.process.kill('SIGKILL');
                     }
-                    
-                    async function testGo() {
-                        document.getElementById('results').innerHTML = 'Testing Go service via JavaScript orchestrator...';
-                        try {
-                            const response = await fetch('/api/test-go');
-                            const result = await response.json();
-                            document.getElementById('results').innerHTML = JSON.stringify(result, null, 2);
-                        } catch (error) {
-                            document.getElementById('results').innerHTML = \`Error: \${error.message}\`;
-                        }
-                    }
-                    
-                    async function testPython() {
-                        document.getElementById('results').innerHTML = 'Testing Python service via JavaScript orchestrator...';
-                        try {
-                            const response = await fetch('/api/test-python');
-                            const result = await response.json();
-                            document.getElementById('results').innerHTML = JSON.stringify(result, null, 2);
-                        } catch (error) {
-                            document.getElementById('results').innerHTML = \`Error: \${error.message}\`;
-                        }
-                    }
-                    
-                    async function testFullOrchestration() {
-                        document.getElementById('results').innerHTML = 'Running full orchestration test...';
-                        try {
-                            const response = await fetch('/api/orchestration-test');
-                            const result = await response.json();
-                            document.getElementById('results').innerHTML = JSON.stringify(result, null, 2);
-                        } catch (error) {
-                            document.getElementById('results').innerHTML = \`Error: \${error.message}\`;
-                        }
-                    }
-                    
-                    async function getStatus() {
-                        document.getElementById('results').innerHTML = 'Getting system status...';
-                        try {
-                            const response = await fetch('/api/status');
-                            const result = await response.json();
-                            document.getElementById('results').innerHTML = JSON.stringify(result, null, 2);
-                        } catch (error) {
-                            document.getElementById('results').innerHTML = \`Error: \${error.message}\`;
-                        }
-                    }
-                    
-                    async function healthCheckAll() {
-                        document.getElementById('results').innerHTML = 'Checking health of all services...';
-                        try {
-                            const response = await fetch('/api/health-check-all');
-                            const result = await response.json();
-                            document.getElementById('results').innerHTML = JSON.stringify(result, null, 2);
-                        } catch (error) {
-                            document.getElementById('results').innerHTML = \`Error: \${error.message}\`;
-                        }
-                    }
-                </script>
-            </body>
-            </html>
-            `);
-        });
-
-        // API Routes
-        this.app.get('/api/status', (req, res) => {
-            res.json(this.getSystemStatus());
-        });
-
-        this.app.get('/api/js-test', (req, res) => {
-            res.json({
-                orchestrator: 'JavaScript',
-                capabilities: ['interface_management', 'service_orchestration', 'real_time_monitoring'],
-                message: 'JavaScript orchestrateur fonctionnel',
-                timestamp: new Date().toISOString(),
-                innovation: 'Interface + Orchestration unifiées'
-            });
-        });
-
-        this.app.get('/api/test-go', async (req, res) => {
-            const result = await this.callService('go-service', '/process');
-            res.json(result);
-        });
-
-        this.app.get('/api/test-python', async (req, res) => {
-            const testData = { data: 'orchestration_test_from_js' };
-            const result = await this.callService('python-service', '/process', testData);
-            res.json(result);
-        });
-
-        this.app.get('/api/health-check-all', async (req, res) => {
-            const healthResults = {};
-            
-            for (const serviceName of this.services.keys()) {
-                healthResults[serviceName] = await this.checkServiceHealth(serviceName);
+                }, 5000);
+            } catch (error) {
+                this.log(`Erreur arrêt service ${serviceName}: ${error.message}`, 'ERROR');
             }
-            
-            res.json({
-                orchestrator: 'JavaScript',
-                health_checks: healthResults,
-                timestamp: new Date().toISOString()
-            });
-        });
-
-        this.app.get('/api/orchestration-test', async (req, res) => {
-            const results = {
-                orchestration_test: true,
-                orchestrator: 'JavaScript',
-                timestamp: new Date().toISOString(),
-                services_tested: []
-            };
-
-            // Test Go service
-            const goResult = await this.callService('go-service', '/process');
-            if (goResult.success) {
-                results.go_service = goResult.data;
-                results.services_tested.push('go');
-            }
-
-            // Test Python service  
-            const pythonResult = await this.callService('python-service', '/process', {
-                data: 'js_orchestrated_test'
-            });
-            if (pythonResult.success) {
-                results.python_service = pythonResult.data;
-                results.services_tested.push('python');
-            }
-
-            // JavaScript orchestration summary
-            results.javascript_orchestrator = {
-                role: 'interface_and_coordinator',
-                message: 'Successfully orchestrated multi-language services from JavaScript',
-                services_coordinated: results.services_tested,
-                architecture: 'Unified UI + Orchestration'
-            };
-
-            res.json(results);
-        });
-    }
-
-    async initializeServices() {
-        this.log('Initialisation des services ILN...');
-
-        // Configuration des services
-        const serviceConfigs = {
-            'go-service': {
-                command: ['./services/go-service'],
-                port: 8001,
-                env: { GO_PORT: '8001' }
-            },
-            'python-service': {
-                command: ['python3', './services/python-service.py'],
-                port: 8002,
-                env: { PYTHON_PORT: '8002' }
-            }
-        };
-
-        // Démarrer tous les services
-        for (const [name, config] of Object.entries(serviceConfigs)) {
-            await this.startService(name, config);
-            // Délai entre démarrages
-            await new Promise(resolve => setTimeout(resolve, 2000));
         }
-
-        this.log('Tous les services initialisés');
-    }
-
-    async start() {
-        this.log('Démarrage de l\'orchestrateur JavaScript ILN...');
         
-        // Démarrer les services en arrière-plan
-        setTimeout(() => this.initializeServices(), 3000);
-        
-        // Démarrer le serveur web
-        this.app.listen(this.port, () => {
-            this.log(`Serveur JavaScript orchestrateur démarré sur le port ${this.port}`);
-            this.log('Interface disponible sur http://localhost:' + this.port);
-        });
+        this.log('Tous les services arrêtés', 'INFO');
     }
 }
 
-// Point d'entrée principal
-const orchestrator = new ILNJavaScriptOrchestrator();
+// ==========================================
+// INITIALISATION ORCHESTRATEUR
+// ==========================================
 
-// Gestion propre de l'arrêt
-process.on('SIGTERM', () => {
-    console.log('Arrêt en cours...');
-    for (const [name, service] of orchestrator.services.entries()) {
-        if (service.process) {
-            service.process.kill();
-        }
-    }
+const app = express();
+const serviceManager = new ServiceManager();
+
+app.use(express.json());
+
+// Gestion gracieuse des arrêts
+process.on('SIGTERM', async () => {
+    console.log('Signal SIGTERM reçu, arrêt gracieux...');
+    await serviceManager.shutdown();
     process.exit(0);
 });
 
-process.on('SIGINT', () => {
-    console.log('\\nArrêt demandé par l\'utilisateur');
-    for (const [name, service] of orchestrator.services.entries()) {
-        if (service.process) {
-            service.process.kill();
-        }
-    }
+process.on('SIGINT', async () => {
+    console.log('Signal SIGINT reçu, arrêt gracieux...');
+    await serviceManager.shutdown();
     process.exit(0);
 });
 
-// Démarrage de l'orchestrateur
-orchestrator.start();
+// ==========================================
+// ROUTES API
+// ==========================================
+
+// Health check orchestrateur
+app.get('/health', (req, res) => {
+    const serviceStatuses = serviceManager.getServiceStatus();
+    const allHealthy = Object.values(serviceStatuses).every(s => s.status === 'running');
+    
+    res.status(allHealthy ? 200 : 503).json({
+        status: allHealthy ? 'healthy' : 'unhealthy',
+        orchestrator: 'running',
+        services: serviceStatuses,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Status détaillé
+app.get('/status', (req, res) => {
+    res.json({
+        orchestrator: {
+            status: 'running',
+            language: 'JavaScript',
+            version: '1.0.0',
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            pid: process.pid
+        },
+        services: serviceManager.getServiceStatus(),
+        logs: serviceManager.startupLog.slice(-20) // 20 derniers logs
+    });
+});
+
+// Traitement Go service
+app.post('/process/go', async (req, res) => {
+    try {
+        const response = await serviceManager.makeServiceRequest('go', '/process', 'POST', req.body);
+        
+        res.json({
+            orchestrator: {
+                message: 'Successfully processed with Go service',
+                language: 'JavaScript'
+            },
+            go_service: response.data
+        });
+    } catch (error) {
+        serviceManager.log(`Erreur traitement Go: ${error.message}`, 'ERROR');
+        res.status(500).json({
+            error: 'Go service processing failed',
+            message: error.message
+        });
+    }
+});
+
+// Traitement Python service  
+app.post('/process/python', async (req, res) => {
+    try {
+        const response = await serviceManager.makeServiceRequest('python', '/process', 'POST', req.body);
+        
+        res.json({
+            orchestrator: {
+                message: 'Successfully processed with Python service',
+                language: 'JavaScript'
+            },
+            python_service: response.data
+        });
+    } catch (error) {
+        serviceManager.log(`Erreur traitement Python: ${error.message}`, 'ERROR');
+        res.status(500).json({
+            error: 'Python service processing failed',
+            message: error.message
+        });
+    }
+});
+
+// Traitement coordonné multi-services
+app.post('/process/multi', async (req, res) => {
+    try {
+        const startTime = Date.now();
+        
+        // Traitement parallèle des services
+        const [goResponse, pythonResponse] = await Promise.all([
+            serviceManager.makeServiceRequest('go', '/process', 'POST', req.body),
+            serviceManager.makeServiceRequest('python', '/process', 'POST', req.body)
+        ]);
+        
+        const processingTime = Date.now() - startTime;
+        
+        res.json({
+            orchestrator: {
+                message: 'Successfully orchestrated multi-language processing',
+                language: 'JavaScript',
+                processing_time_ms: processingTime,
+                services_coordinated: ['go', 'python']
+            },
+            go_service: goResponse.data,
+            python_service: pythonResponse.data
+        });
+    } catch (error) {
+        serviceManager.log(`Erreur traitement multi-services: ${error.message}`, 'ERROR');
+        res.status(500).json({
+            error: 'Multi-service processing failed',
+            message: error.message
+        });
+    }
+});
+
+// Route de démonstration des capacités
+app.get('/', (req, res) => {
+    res.json({
+        message: 'ILN Architecture 1B - JavaScript Orchestrateur',
+        capabilities: [
+            'Multi-language service orchestration',
+            'Go service integration',
+            'Python service integration', 
+            'Parallel processing coordination',
+            'Health monitoring',
+            'Service lifecycle management'
+        ],
+        endpoints: [
+            'GET /health - Health check',
+            'GET /status - Detailed status',
+            'POST /process/go - Process with Go service',
+            'POST /process/python - Process with Python service',
+            'POST /process/multi - Coordinated multi-service processing'
+        ]
+    });
+});
+
+// ==========================================
+// DÉMARRAGE ORCHESTRATEUR
+// ==========================================
+
+async function startOrchestrator() {
+    try {
+        serviceManager.log('Démarrage ILN Architecture 1B - JavaScript Orchestrateur', 'INFO');
+        
+        // Démarrer les services en parallèle
+        await Promise.all([
+            serviceManager.startService('go'),
+            serviceManager.startService('python')
+        ]);
+        
+        // Démarrer le serveur orchestrateur
+        const server = app.listen(serviceManager.ports.orchestrator, () => {
+            serviceManager.log(`Orchestrateur JavaScript démarré sur le port ${serviceManager.ports.orchestrator}`, 'INFO');
+            serviceManager.log('Tous les services sont opérationnels', 'INFO');
+            
+            // Affichage de confirmation
+            console.log('\n🚀 ILN ARCHITECTURE 1B OPÉRATIONNELLE');
+            console.log('=====================================');
+            console.log(`🎯 Orchestrateur JavaScript: http://localhost:${serviceManager.ports.orchestrator}`);
+            console.log(`⚡ Service Go: port ${serviceManager.ports.goService}`);
+            console.log(`🐍 Service Python: port ${serviceManager.ports.pythonService}`);
+            console.log('=====================================\n');
+        });
+        
+        // Gestion gracieuse des arrêts du serveur
+        process.on('SIGTERM', () => {
+            server.close(() => {
+                serviceManager.shutdown();
+            });
+        });
+        
+    } catch (error) {
+        serviceManager.log(`Erreur critique au démarrage: ${error.message}`, 'ERROR');
+        console.error('❌ Échec du démarrage de l\'orchestrateur:', error);
+        process.exit(1);
+    }
+}
+
+// Démarrage automatique
+startOrchestrator();

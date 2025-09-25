@@ -1,76 +1,59 @@
-# syntax=docker/dockerfile:1
+# Dockerfile Simple - Architecture ILN Multi-Language
+# Fichiers séparés : main.go + app.js + app.py + package.json
 
-# SOLUTION DÉFINITIVE - Architecture 1B JavaScript Orchestrateur
-# Résout : npm "idealTree" + pip "externally-managed-environment"
-
-# === STAGE 1: BUILD GO SERVICE ===
+# ===============================================
+# ÉTAPE 1: COMPILATION GO
+# ===============================================
 FROM golang:1.22-alpine AS go-builder
-WORKDIR /go-service
+WORKDIR /go-app
 COPY main.go .
+RUN go mod init go-service && go build -o go-service main.go
 
-RUN go mod init go-service && \
-    go build -ldflags="-s -w" -o go-service main.go && \
-    chmod +x go-service
+# ===============================================  
+# ÉTAPE 2: SETUP NODE.JS (Docker gère les dépendances)
+# ===============================================
+FROM node:18-alpine AS node-builder
+WORKDIR /node-app
 
-# === STAGE 2: PRÉPARER SERVICE PYTHON ===  
-FROM python:3.11-slim AS python-builder
-WORKDIR /python-service
+# Docker gère les dépendances au lieu de package.json
+RUN npm install express --production
 
-# SOLUTION PEP 668 : Forcer installation avec --break-system-packages
-RUN pip install --break-system-packages flask requests
+# Copier seulement le code applicatif
+COPY app.js ./
 
-COPY python-service.py .
+# ===============================================
+# ÉTAPE 3: CONTAINER FINAL PYTHON
+# ===============================================
+FROM python:3.11-slim AS final
 
-# === STAGE FINAL: NODE.JS ORCHESTRATEUR ===
-FROM node:18-slim AS final
+# Installer Node.js dans le container final
+RUN apt-get update && apt-get install -y \
+    nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
 
-# Installation système + Python avec gestion PEP 668
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        python3 \
-        python3-pip \
-        ca-certificates \
-        curl && \
-    rm -rf /var/lib/apt/lists/*
+# Installer les dépendances Python
+RUN pip install --no-cache-dir \
+    flask \
+    requests
 
-# SOLUTION npm idealTree : Installation via package.json pré-créé
-WORKDIR /tmp
-RUN echo '{"dependencies":{"express":"^4.18.2"}}' > package.json && \
-    npm install --no-audit --no-fund --production
+# Créer la structure des services
+RUN mkdir -p /app/services/node-service
 
-# SOLUTION PEP 668 : Installation Python avec flag approprié  
-RUN pip3 install --break-system-packages flask requests
+# Copier tous les services compilés/préparés
+COPY --from=go-builder /go-app/go-service /app/services/
+COPY --from=node-builder /node-app/ /app/services/node-service/
 
-# Configuration application
-RUN mkdir -p /app/services
-WORKDIR /app
-
-# Copier node_modules depuis installation temp
-RUN cp -r /tmp/node_modules /app/
-
-# Copier services compilés
-COPY --from=go-builder --chmod=755 /go-service/go-service /app/services/
-COPY --from=python-builder /python-service/ /app/services/python-service/
-
-# Copier orchestrateur JavaScript
-COPY app.js /app/
-
-# Configuration sécurisée
-RUN groupadd -r appgroup && \
-    useradd -r -g appgroup -s /bin/false appuser && \
-    chown -R appuser:appgroup /app
+# Copier l'orchestrateur principal Python
+COPY app.py /app/app.py
 
 # Variables d'environnement
 ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
-ENV NODE_ENV=production
+ENV GO_PORT=8001
+ENV NODE_PORT=8002
 
-# Configuration finale
-EXPOSE 8000
+# Point de démarrage
+WORKDIR /app
+EXPOSE 8000 8001 8002
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-USER appuser
-
-CMD ["node", "app.js"]
+CMD ["python", "app.py"]
